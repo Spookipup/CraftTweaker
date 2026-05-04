@@ -27,6 +27,7 @@ import minetweaker.runtime.GlobalRegistry;
 import minetweaker.runtime.ILogger;
 import minetweaker.runtime.ITweaker;
 import minetweaker.runtime.MTTweaker;
+import minetweaker.util.ModOnlyHelper;
 import stanhebben.zenscript.annotations.ZenClass;
 import stanhebben.zenscript.annotations.ZenExpansion;
 import stanhebben.zenscript.symbols.IZenSymbol;
@@ -242,14 +243,8 @@ public class MineTweakerAPI {
                 outer: for (Class cls : classes) {
                     for (Annotation annotation : cls.getAnnotations()) {
                         if (annotation instanceof ModOnly) {
-                            String[] value = ((ModOnly) annotation).value();
-                            String version = ((ModOnly) annotation).version();
-
-                            for (String mod : value) {
-                                if (!loadedMods.contains(mod)) continue outer;
-
-                                if (!loadedMods.get(mod).getVersion().startsWith(version)) continue outer;
-                            }
+                            ModOnly modOnly = (ModOnly) annotation;
+                            if (!ModOnlyHelper.isModOnlyLoaded(modOnly.value(), modOnly.version())) continue outer;
                         }
                     }
 

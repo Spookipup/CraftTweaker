@@ -22,6 +22,7 @@ import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -55,9 +56,9 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
         final File outputDir = getOutputDir().get().getAsFile();
         final String className = getClassName().get();
 
-		List<String> classNames = new ArrayList<>();
+		List<RegisteredClass> registeredClasses = new ArrayList<>();
 		List<OnRegisterMethod> onRegisterMethods = new ArrayList<>();
-		iterate(inputDir, null, classNames, onRegisterMethods);
+		iterate(inputDir, null, registeredClasses, onRegisterMethods);
 
 		String fullClassName = className.replace('.', '/');
 
@@ -68,14 +69,23 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 		MethodVisitor method = output.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "getClasses", "(Ljava/util/List;)V", null, null);
 		method.visitCode();
 
-		for (String clsName : classNames) {
+		for (RegisteredClass registeredClass : registeredClasses) {
+			Label skip = visitModOnlyGuard(method, registeredClass.modOnly);
 			method.visitVarInsn(Opcodes.ALOAD, 0);
-			method.visitLdcInsn(Type.getType("L" + clsName + ";"));
+			method.visitLdcInsn(Type.getType("L" + registeredClass.className + ";"));
 			method.visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/List", "add", "(Ljava/lang/Object;)Z", true);
+			method.visitInsn(Opcodes.POP);
+			if (skip != null) {
+				method.visitLabel(skip);
+			}
 		}
 
 		for (OnRegisterMethod onRegisterMethod : onRegisterMethods) {
+			Label skip = visitModOnlyGuard(method, onRegisterMethod.modOnly);
 			method.visitMethodInsn(Opcodes.INVOKESTATIC, onRegisterMethod.className, onRegisterMethod.methodName, "()V", false);
+			if (skip != null) {
+				method.visitLabel(skip);
+			}
 		}
 
 		method.visitInsn(Opcodes.RETURN);
@@ -102,23 +112,41 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 		}
 	}
 
-	private void iterate(File dir, String pkg, List<String> classNames, List<OnRegisterMethod> onRegisterMethods) {
+	private Label visitModOnlyGuard(MethodVisitor method, List<ModOnlyDependency> modOnly) {
+		if (modOnly.isEmpty()) {
+			return null;
+		}
+
+		Label skip = new Label();
+		for (ModOnlyDependency dependency : modOnly) {
+			for (String mod : dependency.mods) {
+				method.visitLdcInsn(mod);
+				method.visitLdcInsn(dependency.version);
+				method.visitMethodInsn(Opcodes.INVOKESTATIC, "minetweaker/util/ModOnlyHelper", "isModOnlyLoaded", "(Ljava/lang/String;Ljava/lang/String;)Z", false);
+				method.visitJumpInsn(Opcodes.IFEQ, skip);
+			}
+		}
+
+		return skip;
+	}
+
+	private void iterate(File dir, String pkg, List<RegisteredClass> registeredClasses, List<OnRegisterMethod> onRegisterMethods) {
 		for (File f : dir.listFiles()) {
 			if (f.isDirectory()) {
 				if (pkg == null) {
-					iterate(f, f.getName(), classNames, onRegisterMethods);
+					iterate(f, f.getName(), registeredClasses, onRegisterMethods);
 				} else {
-					iterate(f, pkg + "/" + f.getName(), classNames, onRegisterMethods);
+					iterate(f, pkg + "/" + f.getName(), registeredClasses, onRegisterMethods);
 				}
 			} else if (f.isFile()) {
 				if (f.getName().endsWith(".class")) {
-					processJavaClass(f, pkg, classNames, onRegisterMethods);
+					processJavaClass(f, pkg, registeredClasses, onRegisterMethods);
 				}
 			}
 		}
 	}
 
-	private void processJavaClass(File cls, String pkg, List<String> classNames, List<OnRegisterMethod> onRegisterMethods) {
+	private void processJavaClass(File cls, String pkg, List<RegisteredClass> registeredClasses, List<OnRegisterMethod> onRegisterMethods) {
 		try(InputStream input = new BufferedInputStream(new FileInputStream(cls))) {
             ClassReader reader = new ClassReader(input);
 
@@ -126,22 +154,38 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 			reader.accept(detector, ClassReader.SKIP_CODE);
 			input.close();
 
+			String className = pkg + "/" + cls.getName().substring(0, cls.getName().length() - 6);
 			if (detector.isAnnotated) {
-				classNames.add(pkg + "/" + cls.getName().substring(0, cls.getName().length() - 6));
+				registeredClasses.add(new RegisteredClass(className, detector.modOnly));
 			}
 			for (MethodAnnotationDetector onRegisterMethod : detector.onRegister) {
 				onRegisterMethods.add(new OnRegisterMethod(
-						pkg + "/" + cls.getName().substring(0, cls.getName().length() - 6),
-						onRegisterMethod.name));
+						className,
+						onRegisterMethod.name,
+						combineModOnly(detector.modOnly, onRegisterMethod.modOnly)));
 			}
 		} catch (IOException ex) {
 
 		}
 	}
 
+	private List<ModOnlyDependency> combineModOnly(List<ModOnlyDependency> classMods, List<ModOnlyDependency> methodMods) {
+		if (classMods.isEmpty()) {
+			return methodMods;
+		}
+		if (methodMods.isEmpty()) {
+			return classMods;
+		}
+
+		List<ModOnlyDependency> combined = new ArrayList<>(classMods);
+		combined.addAll(methodMods);
+		return combined;
+	}
+
 	private static class AnnotationDetector extends ClassVisitor {
 		private boolean isAnnotated = false;
 		private List<MethodAnnotationDetector> onRegister = new ArrayList<>();
+		private List<ModOnlyDependency> modOnly = new ArrayList<>();
 
 		public AnnotationDetector() {
 			super(Opcodes.ASM5);
@@ -155,6 +199,8 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 				isAnnotated = true;
 			} else if (desc.equals("Lminetweaker/annotations/BracketHandler;")) {
 				isAnnotated = true;
+			} else if (desc.equals("Lminetweaker/annotations/ModOnly;")) {
+				return new ModOnlyAnnotationVisitor(modOnly);
 			}
 
 			return super.visitAnnotation(desc, visible);
@@ -170,6 +216,7 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 		private final AnnotationDetector detector;
 		private final String name;
 		private final String desc;
+		private List<ModOnlyDependency> modOnly = new ArrayList<>();
 
 		public MethodAnnotationDetector(AnnotationDetector detector, String name, String desc) {
 			super(Opcodes.ASM4);
@@ -187,6 +234,8 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 				} else {
 					throw new RuntimeException("OnRegister annotation must be used on a static method without arguments or return value");
 				}
+			} else if (desc.equals("Lminetweaker/annotations/ModOnly;")) {
+				return new ModOnlyAnnotationVisitor(modOnly);
 			}
 
 			return super.visitAnnotation(desc, visible);
@@ -196,10 +245,82 @@ public abstract class RegisterZenClassesTask extends DefaultTask {
 	private static class OnRegisterMethod {
 		private final String className;
 		private final String methodName;
+		private final List<ModOnlyDependency> modOnly;
 
-		public OnRegisterMethod(String className, String methodName) {
+		public OnRegisterMethod(String className, String methodName, List<ModOnlyDependency> modOnly) {
 			this.className = className;
 			this.methodName = methodName;
+			this.modOnly = modOnly;
+		}
+	}
+
+	private static class RegisteredClass {
+		private final String className;
+		private final List<ModOnlyDependency> modOnly;
+
+		public RegisteredClass(String className, List<ModOnlyDependency> modOnly) {
+			this.className = className;
+			this.modOnly = modOnly;
+		}
+	}
+
+	private static class ModOnlyAnnotationVisitor extends AnnotationVisitor {
+		private final List<ModOnlyDependency> dependencies;
+		private final List<String> mods = new ArrayList<>();
+		private String version = "";
+
+		public ModOnlyAnnotationVisitor(List<ModOnlyDependency> dependencies) {
+			super(Opcodes.ASM5);
+
+			this.dependencies = dependencies;
+		}
+
+		@Override
+		public void visit(String name, Object value) {
+			if ("value".equals(name) && value instanceof String) {
+				mods.add((String) value);
+			} else if ("version".equals(name) && value instanceof String) {
+				version = (String) value;
+			}
+
+			super.visit(name, value);
+		}
+
+		@Override
+		public AnnotationVisitor visitArray(String name) {
+			if ("value".equals(name)) {
+				return new AnnotationVisitor(Opcodes.ASM5) {
+
+					@Override
+					public void visit(String name, Object value) {
+						if (value instanceof String) {
+							mods.add((String) value);
+						}
+
+						super.visit(name, value);
+					}
+				};
+			}
+
+			return super.visitArray(name);
+		}
+
+		@Override
+		public void visitEnd() {
+			if (!mods.isEmpty()) {
+				dependencies.add(new ModOnlyDependency(new ArrayList<>(mods), version));
+			}
+			super.visitEnd();
+		}
+	}
+
+	private static class ModOnlyDependency {
+		private final List<String> mods;
+		private final String version;
+
+		public ModOnlyDependency(List<String> mods, String version) {
+			this.mods = mods;
+			this.version = version;
 		}
 	}
 }
